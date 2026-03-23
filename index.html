@@ -47,8 +47,10 @@
         
         let word = "";
         try {
-            const path = window.location.pathname.split('/');
-            word = b64DecodeUnicode(path[path.length - 1]).toUpperCase().trim();
+            const params = new URLSearchParams(window.location.search);
+            const hex = params.get('challenge');
+            if (!hex) throw new Error('missing');
+            word = hex.match(/.{1,2}/g).map(b => String.fromCharCode(parseInt(b, 16))).join('').toUpperCase().trim();
         } catch(e) { word = "ERRORE"; }
 
         const L = word.length;
