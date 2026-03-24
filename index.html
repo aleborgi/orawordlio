@@ -13,6 +13,11 @@
         @keyframes pop { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
         .pop { animation: pop 0.1s ease-in-out; }
 
+        /* Multi-word grid: ogni riga è un flex con gap normale tra celle e gap grande tra parole */
+        .row-flex { display: flex; align-items: center; justify-content: center; gap: 6px; margin-bottom: 6px; }
+        .word-group { display: flex; gap: 6px; }
+        .word-separator { width: 14px; flex-shrink: 0; } /* spazio visivo tra parole */
+
         /* Generator popup */
         #generatorModal { backdrop-filter: blur(6px); }
         #generatorModal .inner {
@@ -83,12 +88,12 @@
             <button onclick="closeGenerator()" class="absolute top-4 right-4 text-slate-500 hover:text-slate-300 text-2xl leading-none font-bold transition">×</button>
 
             <h2 class="text-xl font-black text-emerald-400 uppercase tracking-widest mb-1">Genera Sfida</h2>
-            <p class="text-slate-400 text-sm mb-6">Scegli una parola e condividi il link con i tuoi studenti.</p>
+            <p class="text-slate-400 text-sm mb-6">Scegli una o più parole (separate da spazio) e condividi il link con i tuoi studenti.</p>
 
             <!-- Input parola -->
-            <label class="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-1.5">Parola</label>
+            <label class="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-1.5">Parola / Frase</label>
             <input id="wordInput" type="text"
-                   placeholder="Es. SCUOLA"
+                   placeholder="Es. BUON GIORNO"
                    oninput="onWordInput()"
                    class="w-full bg-slate-950 border-2 border-slate-700 focus:border-emerald-500 rounded-xl px-4 py-3 outline-none text-white text-xl text-center uppercase font-bold tracking-widest transition-all mb-5">
 
@@ -181,25 +186,62 @@
             const b64 = params.get('challenge');
             if (!b64) throw new Error('missing');
             if (!isValidBase64(b64)) throw new Error('invalid base64');
-            word = b64DecodeUnicode(b64).toUpperCase().trim();
-            if (!word || word.length < 2) throw new Error('empty word');
+            // Normalize multiple spaces to single, trim edges
+            word = b64DecodeUnicode(b64).toUpperCase().trim().replace(/\s+/g, ' ');
+            if (!word || word.replace(/ /g,'').length < 2) throw new Error('empty word');
         } catch(e) { word = "ERRORE"; }
 
-        const L = word.length;
-        let currentAttempt = 0, guesses = ["", "", "", "", "", ""], gameOver = false;
+        // ── Multi-word support ──
+        // spacePositions: set of indices in 'word' that are spaces
+        const spacePositions = new Set();
+        for (let i = 0; i < word.length; i++) { if (word[i] === ' ') spacePositions.add(i); }
+        const L = word.length; // includes spaces (used for indexing tiles)
+        // letterCount: how many non-space chars the user must type
+        const letterCount = word.replace(/ /g, '').length;
+        // wordGroups: array of arrays of letter-indices per word (no spaces)
+        const wordGroups = [];
+        let group = [];
+        for (let i = 0; i < L; i++) {
+            if (word[i] === ' ') { if (group.length) { wordGroups.push(group); group = []; } }
+            else group.push(i);
+        }
+        if (group.length) wordGroups.push(group);
+
+        let currentAttempt = 0;
+        // guesses[r] is a string of length L (with spaces auto-inserted)
+        let guesses = Array(6).fill(null).map(() => Array(L).fill(''));
+        let gameOver = false;
         const keyStates = {};
 
+        // ── Build grid ──
+        // Each row is a flex row with word-groups separated by a spacer div
         const grid = document.getElementById('grid');
-        grid.style.gridTemplateColumns = `repeat(${L}, minmax(0, 1fr))`;
-        const cellSize = L > 9 ? 'w-8 h-10 sm:w-10 sm:h-12 text-lg' : 'w-12 h-12 sm:w-14 sm:h-14 text-2xl';
+        const totalCols = L - spacePositions.size; // visible cells per row
+        const cellSize = totalCols > 9 ? 'w-8 h-10 sm:w-10 sm:h-12 text-lg' : 'w-12 h-12 sm:w-14 sm:h-14 text-2xl';
 
-        for (let i = 0; i < 6 * L; i++) {
-            const div = document.createElement('div');
-            div.id = 'tile-' + i;
-            div.className = `${cellSize} border-2 border-slate-800 flex items-center justify-center font-bold uppercase cell rounded-lg bg-slate-900/50`;
-            grid.appendChild(div);
+        for (let r = 0; r < 6; r++) {
+            const rowDiv = document.createElement('div');
+            rowDiv.className = 'row-flex';
+            wordGroups.forEach((grp, gi) => {
+                const wDiv = document.createElement('div');
+                wDiv.className = 'word-group';
+                grp.forEach(ci => {
+                    const div = document.createElement('div');
+                    div.id = `tile-${r}-${ci}`;
+                    div.className = `${cellSize} border-2 border-slate-800 flex items-center justify-center font-bold uppercase cell rounded-lg bg-slate-900/50`;
+                    wDiv.appendChild(div);
+                });
+                rowDiv.appendChild(wDiv);
+                if (gi < wordGroups.length - 1) {
+                    const sep = document.createElement('div');
+                    sep.className = 'word-separator';
+                    rowDiv.appendChild(sep);
+                }
+            });
+            grid.appendChild(rowDiv);
         }
 
+        // ── Keyboard ──
         const kb = document.getElementById('keyboard');
         KEYBOARD_KEYS.forEach(row => {
             const rowDiv = document.createElement('div'); rowDiv.className = "flex justify-center gap-1";
@@ -214,6 +256,28 @@
             kb.appendChild(rowDiv);
         });
 
+        // ── Helper: get current guess as flat string (spaces included) ──
+        function getGuessStr() { return guesses[currentAttempt].join(''); }
+
+        // ── How many letters (non-space) typed so far ──
+        function typedCount() { return guesses[currentAttempt].filter((c,i) => !spacePositions.has(i) && c !== '').length; }
+
+        // ── Next empty letter-position index ──
+        function nextLetterIdx() {
+            for (let i = 0; i < L; i++) {
+                if (!spacePositions.has(i) && guesses[currentAttempt][i] === '') return i;
+            }
+            return -1;
+        }
+
+        // ── Last filled letter-position index ──
+        function lastFilledLetterIdx() {
+            for (let i = L - 1; i >= 0; i--) {
+                if (!spacePositions.has(i) && guesses[currentAttempt][i] !== '') return i;
+            }
+            return -1;
+        }
+
         function handleKey(key) {
             if (gameOver || document.activeElement.id === 'studentName') return;
             const nameInput = document.getElementById('studentName');
@@ -225,18 +289,34 @@
             nameInput.readOnly = true;
             nameInput.classList.remove('animate-pulse', 'border-red-500');
 
-            let cur = guesses[currentAttempt];
-            if (key === '⌫') guesses[currentAttempt] = cur.slice(0, -1);
-            else if (key === 'INVIO' && cur.length === L) checkRow();
-            else if (cur.length < L && key.length === 1) guesses[currentAttempt] += key;
+            if (key === '⌫') {
+                const li = lastFilledLetterIdx();
+                if (li !== -1) guesses[currentAttempt][li] = '';
+            } else if (key === 'INVIO') {
+                if (typedCount() === letterCount) checkRow();
+            } else if (key.length === 1) {
+                if (typedCount() < letterCount) {
+                    const ni = nextLetterIdx();
+                    if (ni !== -1) {
+                        guesses[currentAttempt][ni] = key;
+                        // Auto-fill spaces after this position
+                        for (let i = ni + 1; i < L; i++) {
+                            if (spacePositions.has(i)) guesses[currentAttempt][i] = ' ';
+                            else break;
+                        }
+                    }
+                }
+            }
             updateVisuals();
         }
 
         function updateVisuals() {
-            for (let i = 0; i < L; i++) {
-                const tile = document.getElementById('tile-' + (currentAttempt * L + i));
-                tile.innerText = guesses[currentAttempt][i] || "";
-                if(tile.innerText) tile.classList.add('pop'); else tile.classList.remove('pop');
+            for (let ci = 0; ci < L; ci++) {
+                if (spacePositions.has(ci)) continue;
+                const tile = document.getElementById(`tile-${currentAttempt}-${ci}`);
+                if (!tile) continue;
+                tile.innerText = guesses[currentAttempt][ci] || "";
+                if (tile.innerText) tile.classList.add('pop'); else tile.classList.remove('pop');
             }
         }
 
@@ -255,41 +335,63 @@
         }
 
         function checkRow() {
-            const guess = guesses[currentAttempt], rowStart = currentAttempt * L;
-            let checkWord = Array.from(word), status = Array(L).fill('absent');
+            const guessArr = guesses[currentAttempt]; // array of chars length L
+            // Build letter-only arrays for comparison (ignore space positions)
+            const wordLetters = Array.from(word).filter((c,i) => !spacePositions.has(i));
+            const guessLetters = guessArr.filter((c,i) => !spacePositions.has(i));
 
-            for (let i = 0; i < L; i++) {
-                if (guess[i] === word[i]) {
-                    status[i] = 'correct'; checkWord[i] = null;
-                    keyStates[guess[i]] = 'correct';
+            let checkWord = [...wordLetters];
+            const status = Array(L).fill(null);
+
+            // Map letter indices back to tile indices
+            const letterIndices = []; // letterIndices[letterPos] = tileIndex
+            for (let i = 0; i < L; i++) { if (!spacePositions.has(i)) letterIndices.push(i); }
+
+            // First pass: correct
+            for (let j = 0; j < letterIndices.length; j++) {
+                if (guessLetters[j] === wordLetters[j]) {
+                    status[letterIndices[j]] = 'correct';
+                    checkWord[j] = null;
+                    keyStates[guessLetters[j]] = 'correct';
                 }
             }
-            for (let i = 0; i < L; i++) {
-                if (status[i] !== 'correct') {
-                    if (checkWord.includes(guess[i])) {
-                        status[i] = 'present'; checkWord[checkWord.indexOf(guess[i])] = null;
-                        if (keyStates[guess[i]] !== 'correct') keyStates[guess[i]] = 'present';
-                    } else if (!keyStates[guess[i]]) {
-                        keyStates[guess[i]] = 'absent';
-                    }
+            // Second pass: present / absent
+            for (let j = 0; j < letterIndices.length; j++) {
+                const ti = letterIndices[j];
+                if (status[ti] === 'correct') continue;
+                const g = guessLetters[j];
+                const ci = checkWord.indexOf(g);
+                if (ci !== -1) {
+                    status[ti] = 'present'; checkWord[ci] = null;
+                    if (keyStates[g] !== 'correct') keyStates[g] = 'present';
+                } else {
+                    status[ti] = 'absent';
+                    if (!keyStates[g]) keyStates[g] = 'absent';
                 }
             }
 
-            for (let i = 0; i < L; i++) {
-                const tile = document.getElementById('tile-' + (rowStart + i));
+            // Animate tiles (skip spaces)
+            const animTiles = letterIndices; // only letter positions
+            animTiles.forEach((ti, order) => {
+                const tile = document.getElementById(`tile-${currentAttempt}-${ti}`);
                 setTimeout(() => {
-                    tile.classList.add(status[i]);
-                    if (i === L - 1) updateKeyboardUI();
-                }, i * 100);
-            }
+                    tile.classList.add(status[ti]);
+                    if (order === animTiles.length - 1) updateKeyboardUI();
+                }, order * 100);
+            });
 
-            if (guess === word) {
+            // Check win: all letters correct
+            const won = guessLetters.every((g, j) => g === wordLetters[j]);
+            if (won) {
                 gameOver = true;
                 setTimeout(() => {
                     document.getElementById('modal').classList.remove('hidden');
                     document.getElementById('stats').innerText = `Hai indovinato in ${currentAttempt + 1} tentativi!`;
-                }, L * 100 + 400);
-            } else if (++currentAttempt === 6) { gameOver = true; alert("Parola corretta: " + word); }
+                }, animTiles.length * 100 + 400);
+            } else if (++currentAttempt === 6) {
+                gameOver = true;
+                alert("Risposta corretta: " + word);
+            }
         }
 
         window.addEventListener('keydown', (e) => {
